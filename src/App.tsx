@@ -29,8 +29,13 @@ import {
   deleteSong as dbDeleteSong,
   clearAllSongs,
   exportLibraryBackup, importLibraryBackup, type LibraryBackup,
+  saveAutoRescanHandle, getAutoRescanHandle,
 } from './lib/db';
 import { importFiles, getTitleArtistDuplicateIds, rescanMissingArt, folderOf, type ImportProgress, type ArtRescanProgress } from './lib/scanner';
+import {
+  supportsFileSystemAccess, pickAutoRescanDirectory, checkReadPermission, requestReadPermission, collectFilesFromHandle,
+  type FSDirectoryHandle,
+} from './lib/fsAccess';
 import { useListeningStats } from './hooks/useListeningStats';
 import type { AppView, HistoryEntry, LibraryRow, Playlist, Song, SortKey } from './types';
 import { DEFAULT_ACCENT, PINNED_HEADER_HEIGHT, ROW_HEIGHT } from './types';
@@ -278,6 +283,34 @@ export default function App() {
   }, []);
   useEffect(() => () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); }, []);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
+  // FIX (progress bar "sometimes visible sometimes not"): importProgress
+  // flips to non-null and back to null in a single synchronous burst when a
+  // scan is fast (few new files, or an art-cache-warm rescan) -- fast enough
+  // that the browser never paints a frame in between, so the bar mounts and
+  // unmounts without ever actually appearing. `visibleImportProgress` mirrors
+  // importProgress but, once shown, stays shown for at least
+  // MIN_PROGRESS_VISIBLE_MS -- so a fast scan still gets one clean visible
+  // pulse instead of sometimes nothing at all. Slow scans are unaffected
+  // (they're already visible far longer than the minimum).
+  const MIN_PROGRESS_VISIBLE_MS = 500;
+  const [visibleImportProgress, setVisibleImportProgress] = useState<ImportProgress | null>(null);
+  const progressShownAt = useRef<number | null>(null);
+  const progressHideTimer = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (importProgress) {
+      if (progressShownAt.current === null) progressShownAt.current = Date.now();
+      if (progressHideTimer.current !== undefined) { clearTimeout(progressHideTimer.current); progressHideTimer.current = undefined; }
+      setVisibleImportProgress(importProgress);
+    } else if (progressShownAt.current !== null) {
+      const remaining = Math.max(0, MIN_PROGRESS_VISIBLE_MS - (Date.now() - progressShownAt.current));
+      progressHideTimer.current = window.setTimeout(() => {
+        setVisibleImportProgress(null);
+        progressShownAt.current = null;
+        progressHideTimer.current = undefined;
+      }, remaining);
+    }
+  }, [importProgress]);
+  useEffect(() => () => { if (progressHideTimer.current !== undefined) clearTimeout(progressHideTimer.current); }, []);
   const [showSettings, setShowSettings] = useState(false);
   const [showQueueModal, setShowQueueModal] = useState(false);
   const [editSong, setEditSong] = useState<Song | null>(null);
@@ -700,25 +733,6 @@ export default function App() {
     e.target.value = '';
   };
 
-  // "Rescan folder" (toolbar, refresh icon): re-select the same folder you
-  // originally imported and only the files that aren't in the library yet
-  // get added -- everything already imported is skipped instead of being
-  // duplicated, unlike the plain "Import folder" button above. There's no
-  // way to remember *which* folder without the File System Access API
-  // (which webkitdirectory doesn't give us, and isn't supported in every
-  // browser this app targets), so this still means picking the folder
-  // again each time -- it just makes doing that safe to repeat.
-  //
-  // Dedup key is `${fileName}|${fileSize}` rather than fileKey, since
-  // fileKey is a random id generated fresh per import and was never meant
-  // to be stable across separate import runs -- name+size is what actually
-  // identifies "the same file on disk" when you reselect a folder.
-  // TASK 2: tracks whether an in-progress `importProgress` update came from
-  // the Rescan Library button specifically (vs. the plain "Import folder" /
-  // "Import files" buttons, which also drive importProgress). Used to (a)
-  // show the inline "Scanning… N found" status + spinner right next to the
-  // Rescan button, and (b) disable that button while a scan is running so a
-  // second scan can't be kicked off on top of it.
   const [rescanning, setRescanning] = useState(false);
   // Feature (Folder re-scan/auto-sync): songs whose folder was covered by
   // the just-reselected batch but whose file is no longer in it -- offered
@@ -726,10 +740,16 @@ export default function App() {
   // scoping comment below for why this check is safe to run at all).
   const [removedCandidates, setRemovedCandidates] = useState<Song[] | null>(null);
 
-  const handleRescanFolder = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files?.length) return;
-    const fileArr0 = Array.from(files);
+  // Feature (Auto Rescan): the actual scan-and-import logic, pulled out of
+  // the <input webkitdirectory> change handler so it can be driven by *any*
+  // File[] source -- the manual picker (below) or a silently-collected
+  // File[] from a stored File System Access API directory handle (see
+  // runAutoRescan further down). `silent` suppresses the "No new songs
+  // found" toast, which would otherwise fire every single time the app
+  // auto-rescans and finds nothing new -- expected almost every time,
+  // and not something worth interrupting the person for.
+  const runRescan = useCallback(async (fileArr0: File[], opts?: { silent?: boolean }) => {
+    if (rescanning || fileArr0.length === 0) return;
     const selectedKeys = new Set(fileArr0.map((f) => `${f.name}|${f.size}`));
     // Only folders actually represented in this reselection are eligible for
     // "missing file" detection below -- a song from a folder that simply
@@ -743,8 +763,7 @@ export default function App() {
       s.importFolder !== undefined && selectedFolders.has(s.importFolder) && !selectedKeys.has(`${s.fileName}|${s.fileSize}`));
 
     if (fileArr.length === 0) {
-      showToast(`No new songs found (${skipped} already in library)`);
-      e.target.value = '';
+      if (!opts?.silent) showToast(`No new songs found (${skipped} already in library)`);
       if (missing.length > 0) setRemovedCandidates(missing);
       return;
     }
@@ -756,19 +775,124 @@ export default function App() {
       setSongs(allSongs);
       // Success message auto-dismisses after 3s (longer than the default
       // 1.5s toast) so it's easy to read after watching a scan run.
-      showToast(
-        result.added > 0
-          ? `Library updated — ${allSongs.length} song${allSongs.length !== 1 ? 's' : ''} found`
-          : `No new songs found (${skipped} already in library)`,
-        3000,
-      );
+      if (result.added > 0) {
+        showToast(`Library updated — ${allSongs.length} song${allSongs.length !== 1 ? 's' : ''} found`, 3000);
+      } else if (!opts?.silent) {
+        showToast(`No new songs found (${skipped} already in library)`, 3000);
+      }
     } finally {
       setImportProgress(null);
       setRescanning(false);
-      e.target.value = '';
       if (missing.length > 0) setRemovedCandidates(missing);
     }
+  }, [songs, rescanning, showToast]);
+
+  // "Rescan folder" (toolbar, refresh icon): re-select the same folder you
+  // originally imported and only the files that aren't in the library yet
+  // get added -- everything already imported is skipped instead of being
+  // duplicated, unlike the plain "Import folder" button above. This picker-
+  // based flow always needs a fresh click (browsers won't let JS trigger a
+  // file/directory picker without one) -- see runAutoRescan below for the
+  // File System Access API path that avoids that for people who opt in.
+  const handleRescanFolder = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    const fileArr0 = files?.length ? Array.from(files) : [];
+    e.target.value = '';
+    if (fileArr0.length > 0) await runRescan(fileArr0);
   };
+
+  // Feature (Auto Rescan): silently re-scans a previously-picked directory
+  // handle with zero prompts, as long as read permission is still granted --
+  // this is what actually removes the need to tap Rescan every time. Kept
+  // as a ref-mirrored callback (see runRescanRef below) so the mount/focus
+  // effects that call it don't need to be re-subscribed every time `songs`
+  // changes (which is what would otherwise force runRescan -- and therefore
+  // this -- to be recreated constantly).
+  const [autoRescanHandle, setAutoRescanHandle] = useState<FSDirectoryHandle | null>(null);
+  // Drives a small "needs permission" banner: browsers don't guarantee a
+  // File System Access API grant survives forever (a full browser restart
+  // can reset it back to 'prompt'), and re-requesting it requires an actual
+  // user gesture -- so when that happens, this asks once instead of just
+  // silently going stale forever.
+  const [autoRescanNeedsPermission, setAutoRescanNeedsPermission] = useState(false);
+  const runRescanRef = useRef(runRescan);
+  useEffect(() => { runRescanRef.current = runRescan; }, [runRescan]);
+  // Throttles auto-triggered rescans (app focus/visibility regain can fire
+  // repeatedly in a short span) without limiting explicit ones (enabling it
+  // in Settings, or resuming after a permission prompt) -- those pass force.
+  const AUTO_RESCAN_MIN_INTERVAL_MS = 60_000;
+  const lastAutoRescanAt = useRef(0);
+  const runAutoRescan = useCallback(async (handle: FSDirectoryHandle, force = false) => {
+    if (!force && Date.now() - lastAutoRescanAt.current < AUTO_RESCAN_MIN_INTERVAL_MS) return;
+    const perm = await checkReadPermission(handle);
+    if (perm !== 'granted') { setAutoRescanNeedsPermission(true); return; }
+    setAutoRescanNeedsPermission(false);
+    lastAutoRescanAt.current = Date.now();
+    try {
+      const files = await collectFilesFromHandle(handle);
+      await runRescanRef.current(files, { silent: true });
+    } catch (e) {
+      console.warn('Auto rescan: scan failed', e);
+    }
+  }, []);
+
+  // Kicks off the first auto-rescan of the session once the initial library
+  // load has actually finished (`loading` false) -- not on raw mount, since
+  // `songs` is still empty at that point and runRescan would (wrongly) treat
+  // every file in the folder as new. `initialAutoRescanDone` makes sure this
+  // only ever fires once even though `loading` and `runAutoRescan` are both
+  // in the dependency array.
+  const initialAutoRescanDone = useRef(false);
+  useEffect(() => {
+    if (loading || initialAutoRescanDone.current || !supportsFileSystemAccess) return;
+    initialAutoRescanDone.current = true;
+    (async () => {
+      const handle = await getAutoRescanHandle();
+      if (handle) {
+        setAutoRescanHandle(handle);
+        runAutoRescan(handle, true);
+      }
+    })();
+  }, [loading, runAutoRescan]);
+
+  // Re-checks whenever the app regains focus/visibility -- covers "reopened
+  // the PWA from the home screen" or "switched back to this tab", which is
+  // when new files are actually likely to have shown up, without needing a
+  // full page reload to trigger the mount effect above again.
+  useEffect(() => {
+    if (!autoRescanHandle) return;
+    const trigger = () => { if (document.visibilityState === 'visible') runAutoRescan(autoRescanHandle); };
+    document.addEventListener('visibilitychange', trigger);
+    window.addEventListener('focus', trigger);
+    return () => {
+      document.removeEventListener('visibilitychange', trigger);
+      window.removeEventListener('focus', trigger);
+    };
+  }, [autoRescanHandle, runAutoRescan]);
+
+  const handleEnableAutoRescan = useCallback(async () => {
+    const handle = await pickAutoRescanDirectory();
+    if (!handle) return;
+    await saveAutoRescanHandle(handle);
+    setAutoRescanHandle(handle);
+    setAutoRescanNeedsPermission(false);
+    showToast('Auto rescan enabled');
+    runAutoRescan(handle, true);
+  }, [runAutoRescan, showToast]);
+
+  const handleDisableAutoRescan = useCallback(async () => {
+    await saveAutoRescanHandle(null);
+    setAutoRescanHandle(null);
+    setAutoRescanNeedsPermission(false);
+    showToast('Auto rescan disabled');
+  }, [showToast]);
+
+  const handleResumeAutoRescanPermission = useCallback(async () => {
+    if (!autoRescanHandle) return;
+    const perm = await requestReadPermission(autoRescanHandle);
+    if (perm === 'granted') { setAutoRescanNeedsPermission(false); runAutoRescan(autoRescanHandle, true); }
+    else showToast('Permission denied — auto rescan paused');
+  }, [autoRescanHandle, runAutoRescan, showToast]);
 
   const handleConfirmRemoveMissing = useCallback(async () => {
     const toRemove = removedCandidates ?? [];
@@ -1068,9 +1192,9 @@ export default function App() {
                     webkitdirectory="" directory="" multiple accept="audio/*" className="hidden" onChange={handleRescanFolder} />
                 </label>
                 {/* Inline scan status, adjacent to the Rescan button (Task 2) */}
-                {rescanning && importProgress && (
+                {rescanning && visibleImportProgress && (
                   <span className="hidden sm:inline text-white/50 text-xs whitespace-nowrap animate-fade-in">
-                    Scanning… {importProgress.current} / {importProgress.total} found
+                    Scanning… {visibleImportProgress.current} / {visibleImportProgress.total} found
                   </span>
                 )}
                 {/* Individual file import */}
@@ -1081,18 +1205,54 @@ export default function App() {
               </div>
             </div>
 
-            {/* Import progress */}
-            {importProgress && (
-              <div className="px-4 py-2 shrink-0" style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                <div className="flex items-center gap-2 text-white/50 text-xs mb-1.5">
-                  <Loader2 size={11} className="animate-spin" />
-                  {importProgress.finalizing
-                    ? `Saving ${importProgress.current} / ${importProgress.total}…`
-                    : importProgress.fileName ? `Importing ${importProgress.current} / ${importProgress.total} — ${importProgress.fileName}` : `Importing ${importProgress.current} / ${importProgress.total}…`}
+            {/* Import / rescan progress.
+                FIX (rescan progress not visible): this bar already covered
+                the Rescan Folder button (it shares importProgress state with
+                regular import), but at 2px tall with no percentage readout
+                it was easy to miss entirely, especially on a fast scan or on
+                a phone where the inline "Scanning… N found" text next to the
+                button is hidden (`hidden sm:inline`, no room for it there).
+                Bumped to a proper 6px bar with a percentage, and worded
+                specifically as "Scanning" (not "Importing") while it's the
+                rescan flow driving it. */}
+            {visibleImportProgress && (
+              <div className="px-4 py-2.5 shrink-0" style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                <div className="flex items-center justify-between gap-2 text-white/60 text-xs mb-1.5">
+                  <span className="flex items-center gap-2 min-w-0">
+                    <Loader2 size={12} className="animate-spin shrink-0" style={{ color: accentColor }} />
+                    <span className="truncate">
+                      {visibleImportProgress.finalizing
+                        ? `Saving ${visibleImportProgress.current} / ${visibleImportProgress.total}…`
+                        : rescanning
+                          ? `Scanning folder… ${visibleImportProgress.current} / ${visibleImportProgress.total}`
+                          : visibleImportProgress.fileName ? `Importing ${visibleImportProgress.current} / ${visibleImportProgress.total} — ${visibleImportProgress.fileName}` : `Importing ${visibleImportProgress.current} / ${visibleImportProgress.total}…`}
+                    </span>
+                  </span>
+                  <span className="tabular-nums shrink-0">{Math.round((visibleImportProgress.current / Math.max(visibleImportProgress.total, 1)) * 100)}%</span>
                 </div>
-                <div className="h-0.5 bg-white/10 rounded-full overflow-hidden">
-                  <div className="h-full rounded-full transition-all" style={{ width: `${(importProgress.current / Math.max(importProgress.total, 1)) * 100}%`, background: accentColor }} />
+                <div className="h-1 bg-white/10 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full transition-all" style={{ width: `${(visibleImportProgress.current / Math.max(visibleImportProgress.total, 1)) * 100}%`, background: accentColor }} />
                 </div>
+              </div>
+            )}
+
+            {/* Feature (Auto Rescan): browsers don't guarantee a File System
+                Access API permission grant survives forever (a full browser
+                restart can reset it to 'prompt'), and re-granting needs an
+                actual tap -- this banner is that one tap, shown only when
+                it's actually needed instead of on every app open. */}
+            {autoRescanNeedsPermission && (
+              <div className="px-4 py-2 flex items-center justify-between gap-3 shrink-0"
+                style={{ background: `${accentColor}12`, borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                <span className="flex items-center gap-2 text-white/70 text-xs min-w-0">
+                  <FolderOpen size={13} className="shrink-0" style={{ color: accentColor }} />
+                  <span className="truncate">Auto rescan needs permission to keep watching your folder.</span>
+                </span>
+                <button onClick={handleResumeAutoRescanPermission}
+                  className="text-xs font-semibold px-3 py-1 rounded-full shrink-0 transition-opacity hover:opacity-90"
+                  style={{ background: accentColor, color: getContrastText(accentColor) }}>
+                  Resume
+                </button>
               </div>
             )}
 
@@ -1299,6 +1459,11 @@ export default function App() {
           onEQChange={handleEQChange}
           onExportBackup={handleExportBackup}
           onImportBackupFile={handleImportBackupFile}
+          autoRescanSupported={supportsFileSystemAccess}
+          autoRescanEnabled={!!autoRescanHandle}
+          autoRescanFolderName={autoRescanHandle?.name}
+          onEnableAutoRescan={handleEnableAutoRescan}
+          onDisableAutoRescan={handleDisableAutoRescan}
         />
       )}
       {editSong && <AlbumArtEditModal song={editSong} accentColor={accentColor} onClose={() => setEditSong(null)} onUpdated={(u) => { handleSongUpdated(u); setEditSong(null); }} />}

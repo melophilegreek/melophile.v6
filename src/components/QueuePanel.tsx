@@ -3,6 +3,22 @@ import { X, Trash2, Play, ListMusic, ChevronUp, ChevronDown, GripVertical, ListP
 import type { Song } from '../types';
 import { getArtUrl, useAlbumArtError } from './SongRow';
 import { initialFor, placeholderBackground } from '../lib/artPlaceholder';
+import { VirtualList } from './VirtualList';
+
+// PERF FIX (multi-second lag opening the Queue / dragging to reorder): the
+// queue can hold hundreds of songs (the "auto-queued" rest-of-library tail
+// alone is often 800+), but this panel used to `queue.map(...)` straight
+// into the DOM -- every row mounted at once, every time the panel opened.
+// Dragging made it worse: the reorder animation recomputed a transform for
+// all 800+ rows on every pointermove. The rest of the app already avoids
+// this via VirtualList (only the rows actually on screen get mounted), so
+// the queue list now does the same. A "header" row for the "Next Up" label
+// is included as the first virtualized item, mirroring the pinned-header
+// pattern used in the main library list.
+const HEADER_HEIGHT = 32;
+const QUEUE_ROW_HEIGHT = 52;
+
+type QueueListRow = { kind: 'header' } | { kind: 'song'; song: Song; index: number };
 
 interface Props {
   queue: Song[];
@@ -38,37 +54,18 @@ export function QueuePanel({ queue, userQueueLen, currentSong, accentColor, onCl
   // below aren't reorderable). The up/down chevron buttons are kept
   // alongside dragging as a precise, no-coordination-required fallback.
   //
-  // FIX (drag animation quality): the dragged row now follows the pointer
-  // continuously (translateY tracks the live offset instead of just an
-  // opacity dim), and every row between the drag origin and the current
-  // drop target visually slides out of the way by one row's worth of
-  // space — the standard "make room" reorder animation — instead of only
-  // an inset top-border line marking the target. Row positions are
-  // snapshotted once at drag start so this is pure CSS transform math, not
-  // a live layout read on every pointermove (which would fight itself once
-  // rows start moving).
+  // FIX (drag lag): kept deliberately simple — dim the row being dragged,
+  // outline whichever row it's currently over, done. No per-frame transform
+  // math, no live layout snapshots. The previous version tried to animate
+  // every row sliding out of the way, which meant a style recompute across
+  // the whole rendered list on every single pointermove; combined with the
+  // un-virtualized list that was the main source of the stutter.
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
-  const [dragOffsetY, setDragOffsetY] = useState(0);
   const rowRefs = useRef<Map<number, HTMLDivElement>>(new Map());
-  const dragStartClientY = useRef(0);
-  const dragSnapshot = useRef<Map<number, { top: number; height: number }>>(new Map());
-  const rowStep = useRef(0);
 
   const handleGripPointerDown = useCallback((i: number) => (e: React.PointerEvent) => {
     e.preventDefault();
-    const snapshot = new Map<number, { top: number; height: number }>();
-    rowRefs.current.forEach((el, idx) => {
-      const rect = el.getBoundingClientRect();
-      snapshot.set(idx, { top: rect.top, height: rect.height });
-    });
-    dragSnapshot.current = snapshot;
-    const cur = snapshot.get(i);
-    const next = snapshot.get(i + 1);
-    const prev = snapshot.get(i - 1);
-    rowStep.current = next ? next.top - cur!.top : cur && prev ? cur.top - prev.top : cur?.height ?? 0;
-    dragStartClientY.current = e.clientY;
-    setDragOffsetY(0);
     setDragIndex(i);
     setOverIndex(i);
   }, []);
@@ -76,11 +73,11 @@ export function QueuePanel({ queue, userQueueLen, currentSong, accentColor, onCl
   useEffect(() => {
     if (dragIndex === null) return;
     const onMove = (e: PointerEvent) => {
-      setDragOffsetY(e.clientY - dragStartClientY.current);
       let closest: number | null = null;
       let closestDist = Infinity;
-      dragSnapshot.current.forEach((rect, idx) => {
+      rowRefs.current.forEach((el, idx) => {
         if (idx >= userQueueLen) return; // only the user-queued section is reorderable
+        const rect = el.getBoundingClientRect();
         const center = rect.top + rect.height / 2;
         const dist = Math.abs(e.clientY - center);
         if (dist < closestDist) { closestDist = dist; closest = idx; }
@@ -97,7 +94,6 @@ export function QueuePanel({ queue, userQueueLen, currentSong, accentColor, onCl
         });
         return null;
       });
-      setDragOffsetY(0);
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp, { once: true });
@@ -107,15 +103,9 @@ export function QueuePanel({ queue, userQueueLen, currentSong, accentColor, onCl
     };
   }, [dragIndex, userQueueLen, onReorderQueue]);
 
-  // Per-row visual shift while a drag is active: rows strictly between the
-  // drag origin and the current drop target slide by one row-step to open
-  // up a gap, in the direction the dragged row is moving.
-  const shiftFor = useCallback((i: number): number => {
-    if (dragIndex === null || overIndex === null || i === dragIndex) return 0;
-    if (dragIndex < overIndex && i > dragIndex && i <= overIndex) return -rowStep.current;
-    if (dragIndex > overIndex && i < dragIndex && i >= overIndex) return rowStep.current;
-    return 0;
-  }, [dragIndex, overIndex]);
+  const rows: QueueListRow[] = queue.length === 0
+    ? []
+    : [{ kind: 'header' }, ...queue.map((song, index): QueueListRow => ({ kind: 'song', song, index }))];
 
   return (
     <div ref={ref} className="h-full flex flex-col overflow-hidden">
@@ -150,28 +140,25 @@ export function QueuePanel({ queue, userQueueLen, currentSong, accentColor, onCl
       )}
 
       {/* Queue list */}
-      <div className="flex-1 overflow-y-auto px-4 pb-6">
-        {queue.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-16 text-white/25">
-            <ListMusic size={40} className="mb-3 text-white/15" />
-            <p className="font-medium">Queue is empty</p>
-            <p className="text-xs mt-1">Swipe a song right to queue it</p>
-          </div>
-        ) : (
-          <>
-            <p className="text-xs text-white/30 uppercase tracking-wider font-semibold mb-2 mt-2">Next Up</p>
-            {queue.map((song, i) => {
-              const isUserQueued = i < userQueueLen;
-              const isBeingDragged = dragIndex === i;
-              return (
-              <div key={`${song.id}-${i}`}
-                ref={(el) => { if (el) rowRefs.current.set(i, el); else rowRefs.current.delete(i); }}
-                style={{
-                  position: 'relative',
-                  zIndex: isBeingDragged ? 10 : undefined,
-                  transform: `translateY(${isBeingDragged ? dragOffsetY : shiftFor(i)}px)`,
-                  transition: isBeingDragged ? 'none' : 'transform 0.2s cubic-bezier(0.2,0.8,0.2,1)',
-                }}>
+      {queue.length === 0 ? (
+        <div className="flex-1 flex flex-col items-center justify-center py-16 text-white/25">
+          <ListMusic size={40} className="mb-3 text-white/15" />
+          <p className="font-medium">Queue is empty</p>
+          <p className="text-xs mt-1">Swipe a song right to queue it</p>
+        </div>
+      ) : (
+        <VirtualList
+          className="flex-1 px-4 pb-6"
+          items={rows}
+          getItemHeight={(row) => row.kind === 'header' ? HEADER_HEIGHT : QUEUE_ROW_HEIGHT}
+          renderItem={(row) => {
+            if (row.kind === 'header') {
+              return <p className="text-xs text-white/30 uppercase tracking-wider font-semibold mb-2 mt-2">Next Up</p>;
+            }
+            const { song, index: i } = row;
+            const isUserQueued = i < userQueueLen;
+            return (
+              <div ref={(el) => { if (el) rowRefs.current.set(i, el); else rowRefs.current.delete(i); }}>
                 <QueueRow
                   song={song}
                   accentColor={accentColor}
@@ -181,17 +168,16 @@ export function QueuePanel({ queue, userQueueLen, currentSong, accentColor, onCl
                   onMoveDown={isUserQueued && i < userQueueLen - 1 ? () => onReorderQueue(i, i + 1) : undefined}
                   onGripPointerDown={isUserQueued ? handleGripPointerDown(i) : undefined}
                   onQueueSong={!isUserQueued ? () => onQueueSong(song) : undefined}
-                  isDragging={isBeingDragged}
+                  isDragging={dragIndex === i}
                   isDropTarget={overIndex === i && dragIndex !== null && dragIndex !== i}
                   index={i + 1}
                   isAutoQueued={!isUserQueued}
                 />
               </div>
-              );
-            })}
-          </>
-        )}
-      </div>
+            );
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -267,10 +253,9 @@ function QueueRow({ song, isCurrent, accentColor, onPlay, onRemove, onMoveUp, on
       <div
         className="group flex items-center gap-2 py-2 rounded-lg cursor-pointer hover:bg-white/5 transition-colors px-2 -mx-2"
         style={{
-          transform: `translateX(${dragX}px) ${isDragging ? 'scale(1.02)' : ''}`,
+          transform: `translateX(${dragX}px)`,
           transition: dragging.current ? 'none' : 'transform 0.3s cubic-bezier(0.16,1,0.3,1)',
-          boxShadow: isDragging ? '0 8px 24px rgba(0,0,0,0.45)' : undefined,
-          background: isDragging ? 'rgba(255,255,255,0.06)' : undefined,
+          opacity: isDragging ? 0.4 : 1,
         }}
         onClick={onPlay}
         onTouchStart={onTouchStart}
@@ -280,7 +265,7 @@ function QueueRow({ song, isCurrent, accentColor, onPlay, onRemove, onMoveUp, on
         {/* Drag handle / index */}
         <div className="w-5 shrink-0 flex items-center justify-center">
           {index !== undefined && !isCurrent && !isAutoQueued && (
-            <div onPointerDown={onGripPointerDown} style={{ touchAction: 'none', cursor: isDragging ? 'grabbing' : 'grab' }} className="p-1 -m-1">
+            <div onPointerDown={onGripPointerDown} style={{ touchAction: 'none', cursor: 'grab' }} className="p-1 -m-1">
               <GripVertical size={14} className="text-white/20 group-hover:text-white/40 transition-colors" />
             </div>
           )}

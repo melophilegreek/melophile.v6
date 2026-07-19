@@ -1,6 +1,7 @@
 import { openDB as idbOpen, type IDBPDatabase } from 'idb';
 import type { Song, Playlist, Preferences, HistoryEntry } from '../types';
 import { DEFAULT_ACCENT } from '../types';
+import type { FSDirectoryHandle } from './fsAccess';
 
 interface MelophileDB {
   songs: { key: string; value: Song };
@@ -148,6 +149,25 @@ export async function savePreferences(prefs: Partial<Preferences>): Promise<void
   const db = await getDB();
   const entries = Object.entries(prefs) as [string, unknown][];
   await Promise.all(entries.map(([k, v]) => db.put('preferences', v, k)));
+}
+
+// ── Auto Rescan directory handle ────────────────────────────────────────────
+// Feature (Auto Rescan): stored separately from Preferences (rather than as
+// a field on it) since a FileSystemDirectoryHandle isn't a plain
+// JSON-shaped value like the rest of Preferences -- it's a structured-clone-
+// able browser object, and getPreferences()/savePreferences() above assume
+// every field is safe to read/write as plain data. IndexedDB can store and
+// retrieve the handle itself just fine via structured clone; only Chromium
+// browsers actually produce one (see fsAccess.ts), so this key is simply
+// absent everywhere else.
+export async function saveAutoRescanHandle(handle: FSDirectoryHandle | null): Promise<void> {
+  const db = await getDB();
+  if (handle) await db.put('preferences', handle, 'autoRescanDirHandle');
+  else await db.delete('preferences', 'autoRescanDirHandle');
+}
+export async function getAutoRescanHandle(): Promise<FSDirectoryHandle | undefined> {
+  const db = await getDB();
+  return db.get('preferences', 'autoRescanDirHandle') as Promise<FSDirectoryHandle | undefined>;
 }
 
 // ── Library backup / restore (Feature: export/import) ─────────────────────────

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { X, Check, Heart, Trash2, AlertTriangle, Sparkles, ImagePlus, Download, Upload, SlidersHorizontal, RotateCcw } from 'lucide-react';
+import { X, Check, Heart, Trash2, AlertTriangle, Sparkles, ImagePlus, Download, Upload, SlidersHorizontal, RotateCcw, FolderOpen } from 'lucide-react';
 import type { ArtRescanProgress } from '../lib/scanner';
 import { getContrastText } from '../lib/color';
+import { Slider } from './Slider';
 
 const PRESETS = [
   { name: 'Green', color: '#1DB954' }, { name: 'Purple', color: '#9B59B6' },
@@ -41,11 +42,21 @@ interface Props {
   /** Feature (Library backup/restore) */
   onExportBackup: () => void;
   onImportBackupFile: (file: File) => Promise<{ matchedSongs: number; unmatchedSongs: number; playlistsCreated: number }>;
+  /** Feature (Auto Rescan): whether the browser supports the File System
+   *  Access API this relies on (Chromium only — Chrome/Edge desktop and
+   *  Android; not Safari, not Firefox). */
+  autoRescanSupported: boolean;
+  autoRescanEnabled: boolean;
+  /** Name of the currently-watched folder, shown once enabled. */
+  autoRescanFolderName?: string;
+  onEnableAutoRescan: () => void | Promise<void>;
+  onDisableAutoRescan: () => void | Promise<void>;
 }
 
 export function SettingsPanel({
   accentColor, onAccentChange, onClose, songCount, onDeleteAllSongs, onRescanArt, artRescan,
   crossfadeSeconds, onCrossfadeChange, eq, onEQChange, onExportBackup, onImportBackupFile,
+  autoRescanSupported, autoRescanEnabled, autoRescanFolderName, onEnableAutoRescan, onDisableAutoRescan,
 }: Props) {
   const [hexInput, setHexInput] = useState(accentColor);
   const [confirmingDeleteAll, setConfirmingDeleteAll] = useState(false);
@@ -185,9 +196,9 @@ export function SettingsPanel({
             <label className="text-white/70 text-sm">Crossfade</label>
             <span className="text-white/40 text-xs tabular-nums">{crossfadeSeconds === 0 ? 'Off (gapless)' : `${crossfadeSeconds}s`}</span>
           </div>
-          <input type="range" min={0} max={12} step={1} value={crossfadeSeconds}
-            onChange={(e) => onCrossfadeChange(Number(e.target.value))}
-            className="w-full accent-current" style={{ color: accentColor }} />
+          <Slider value={crossfadeSeconds} min={0} max={12} step={1}
+            onChange={onCrossfadeChange}
+            accentColor={accentColor} ariaLabel="Crossfade" className="w-full" />
           <p className="text-white/30 text-xs mt-1.5 mb-4 leading-snug">
             Overlaps the end of one track with the start of the next. At 0, tracks still transition without the usual gap — the next song is simply preloaded ahead of time instead of overlapping.
           </p>
@@ -202,9 +213,9 @@ export function SettingsPanel({
           {([['bass', 'Bass'], ['mid', 'Mid'], ['treble', 'Treble']] as const).map(([band, label]) => (
             <div key={band} className="flex items-center gap-3 mb-2">
               <span className="text-white/50 text-xs w-12 shrink-0">{label}</span>
-              <input type="range" min={-12} max={12} step={1} value={eq[band]}
-                onChange={(e) => onEQChange(band, Number(e.target.value))}
-                className="flex-1 accent-current" style={{ color: accentColor }} />
+              <Slider value={eq[band]} min={-12} max={12} step={1}
+                onChange={(v) => onEQChange(band, v)}
+                accentColor={accentColor} ariaLabel={label} className="flex-1" />
               <span className="text-white/40 text-xs w-9 text-right tabular-nums shrink-0">{eq[band] > 0 ? '+' : ''}{eq[band]}</span>
             </div>
           ))}
@@ -229,6 +240,47 @@ export function SettingsPanel({
             so it can take a bit for large collections. Songs whose files
             never had art won't be affected.
           </p>
+
+          {/* Feature (Auto Rescan): lets a person pick their music folder
+              once (via the File System Access API) instead of tapping the
+              toolbar Rescan button every time — the app silently re-checks
+              that folder for new files on every app open and whenever it
+              regains focus. Only offered where the browser actually
+              supports it; everyone else keeps using the toolbar button,
+              which still works exactly as before. */}
+          <div className="mt-4 pt-4 border-t border-white/10">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-white/70 text-sm font-medium">Auto rescan</span>
+              {autoRescanEnabled && (
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full" style={{ background: `${accentColor}25`, color: accentColor }}>ON</span>
+              )}
+            </div>
+            <p className="text-white/30 text-xs mb-3 leading-snug">
+              {autoRescanSupported
+                ? 'Automatically checks your music folder for new songs whenever you open the app — no need to tap Rescan yourself.'
+                : "Not available in this browser — it needs a folder-access feature only Chrome and Edge currently support. Use the Rescan button in the toolbar instead."}
+            </p>
+            {autoRescanSupported && (
+              autoRescanEnabled ? (
+                <button
+                  onClick={onDisableAutoRescan}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border border-white/10 text-white/70 text-sm font-medium transition-colors hover:bg-white/5"
+                >
+                  <FolderOpen size={15} />
+                  <span className="truncate">Watching "{autoRescanFolderName}" — tap to disable</span>
+                </button>
+              ) : (
+                <button
+                  onClick={onEnableAutoRescan}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl font-semibold transition-all hover:opacity-90 active:scale-[0.98]"
+                  style={{ background: accentColor, color: getContrastText(accentColor) }}
+                >
+                  <FolderOpen size={15} />
+                  Enable Auto Rescan
+                </button>
+              )
+            )}
+          </div>
         </div>
 
         {/* Feature (Library backup/restore) */}
