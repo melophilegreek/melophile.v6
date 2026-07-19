@@ -1564,6 +1564,7 @@ export default function App() {
           currentTime={playerState.currentTime}
           accentColor={accentColor}
           onClose={() => setShowLyrics(false)}
+          onUpdated={handleSongUpdated}
         />
       )}
       {showQueueModal && (

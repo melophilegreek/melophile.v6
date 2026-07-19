@@ -333,8 +333,11 @@ export function PlayerBar({
             ) : <p className="text-white/25 text-sm">Nothing playing</p>}
           </div>
           <div className="flex items-center gap-1 shrink-0">
-            <button onClick={onOpenLyrics} disabled={!hasLyrics}
-              className="btn-icon w-8 h-8 disabled:opacity-30" title={hasLyrics ? 'Lyrics' : 'No lyrics found'}>
+            {/* Feature (Lyrics import): stays enabled even with no lyrics yet
+                so tapping it opens the modal's "Import lyrics" prompt —
+                only disabled when nothing is loaded to attach lyrics to. */}
+            <button onClick={onOpenLyrics} disabled={!currentSong}
+              className="btn-icon w-8 h-8 disabled:opacity-30" title={hasLyrics ? 'Lyrics' : 'Import lyrics'}>
               <Mic2 size={16} className="text-white/60" />
             </button>
             <SleepTimerMenu accentColor={accentColor} endsAt={sleepTimerEndsAt} endOfTrack={sleepTimerEndOfTrack} onSet={onSetSleepTimer} align="left" />
@@ -505,8 +508,11 @@ export function PlayerBar({
 
         {/* Right: lyrics + sleep timer + queue + volume */}
         <div className="flex items-center gap-2 w-[28%] justify-end shrink-0">
-          <button onClick={onOpenLyrics} disabled={!hasLyrics}
-            className="btn-icon w-8 h-8 hover:bg-white/10 rounded-lg disabled:opacity-30 disabled:hover:bg-transparent" title={hasLyrics ? 'Lyrics' : 'No lyrics found'}>
+          {/* Feature (Lyrics import): same rationale as the mobile button
+              above — enabled whenever a song is loaded so missing lyrics can
+              be imported, not just viewed once present. */}
+          <button onClick={onOpenLyrics} disabled={!currentSong}
+            className="btn-icon w-8 h-8 hover:bg-white/10 rounded-lg disabled:opacity-30 disabled:hover:bg-transparent" title={hasLyrics ? 'Lyrics' : 'Import lyrics'}>
             <Mic2 size={16} className="text-white/60" />
           </button>
           <SleepTimerMenu accentColor={accentColor} endsAt={sleepTimerEndsAt} endOfTrack={sleepTimerEndOfTrack} onSet={onSetSleepTimer} align="center" />
