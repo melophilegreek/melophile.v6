@@ -50,7 +50,7 @@ export interface Preferences {
   sortDir?: 'asc' | 'desc';
 }
 
-export type SortKey = 'title' | 'artist' | 'dateAdded' | 'duration';
+export type SortKey = 'title' | 'artist' | 'dateAdded' | 'duration' | 'random';
 
 export interface HistoryEntry {
   id: string;        // `${songId}-${timestamp}`

@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import {
   Search, X, FolderOpen, Loader as Loader2, Heart, Trash2, Menu, Music as MusicIcon, TrendingUp, RefreshCw, Plus,
-  ChevronLeft, ArrowUpDown, CheckSquare, ListPlus, FolderPlus,
+  ChevronLeft, ArrowUpDown, CheckSquare, ListPlus, FolderPlus, Shuffle,
 } from 'lucide-react';
 
 import { Onboarding } from './components/Onboarding';
@@ -48,6 +48,29 @@ function getCachedArtUrl(song: Song | null): string | null {
   const url = URL.createObjectURL(new Blob([song.albumArtData], { type: song.albumArtMime || 'image/jpeg' }));
   artUrlCache.set(song.id, url);
   return url;
+}
+
+// Feature (Sort options -- Random): deterministic Fisher-Yates shuffle keyed
+// off `seed` so the resulting order stays stable across re-renders (query
+// changes, playback ticks, etc.) and only reshuffles when the seed itself
+// changes -- i.e. each time the user (re-)picks "Random" in the sort menu.
+function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function shuffleSeeded<T>(arr: T[], seed: number): T[] {
+  const rand = mulberry32(seed);
+  const out = [...arr];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
 }
 
 // FIX (inconsistent toast dismiss timing): this component used to own its
@@ -163,6 +186,7 @@ function SortMenu({ sortBy, sortDir, accentColor, onChange }: {
   const options: { key: SortKey; label: string }[] = [
     { key: 'title', label: 'Title' }, { key: 'artist', label: 'Artist' },
     { key: 'dateAdded', label: 'Date added' }, { key: 'duration', label: 'Duration' },
+    { key: 'random', label: 'Random' },
   ];
   return (
     <div ref={ref} className="relative shrink-0">
@@ -175,11 +199,21 @@ function SortMenu({ sortBy, sortDir, accentColor, onChange }: {
           style={{ background: 'rgba(30,30,30,0.97)', backdropFilter: 'blur(16px)' }}>
           {options.map((opt) => (
             <button key={opt.key}
-              onClick={() => { onChange(opt.key, opt.key === sortBy ? (sortDir === 'asc' ? 'desc' : 'asc') : 'asc'); setOpen(false); }}
+              onClick={() => {
+                // Random has no ascending/descending direction -- every
+                // click (including re-clicking while already active) just
+                // asks for a fresh shuffle, handled by onChange bumping a
+                // seed whenever 'random' is passed.
+                onChange(opt.key, opt.key === 'random' ? 'asc' : (opt.key === sortBy ? (sortDir === 'asc' ? 'desc' : 'asc') : 'asc'));
+                setOpen(false);
+              }}
               className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm hover:bg-white/10 transition-colors"
               style={{ color: sortBy === opt.key ? accentColor : 'rgba(255,255,255,0.75)' }}>
-              {opt.label}
-              {sortBy === opt.key && <span className="text-xs">{sortDir === 'asc' ? '↑' : '↓'}</span>}
+              <span className="flex items-center gap-2">
+                {opt.key === 'random' && <Shuffle size={12} />}
+                {opt.label}
+              </span>
+              {sortBy === opt.key && opt.key !== 'random' && <span className="text-xs">{sortDir === 'asc' ? '↑' : '↓'}</span>}
             </button>
           ))}
         </div>
@@ -330,6 +364,10 @@ export default function App() {
   // Feature (Sort options)
   const [sortBy, setSortBy] = useState<SortKey>('title');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  // Feature (Sort options -- Random): bumped every time "Random" is picked
+  // (including re-picking it while already active) to force a fresh
+  // shuffle -- see shuffleSeeded() and the `filtered` memo below.
+  const [randomSeed, setRandomSeed] = useState(1);
   // Feature (Bulk multi-select actions)
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -443,7 +481,12 @@ export default function App() {
     // IndexedDB ordering already, so skip re-sorting in the (default,
     // common) case — every other combination sorts a copy explicitly.
     if (sortBy === 'title' && sortDir === 'asc') return base;
-    const cmp: Record<SortKey, (a: Song, b: Song) => number> = {
+    // Feature (Sort options -- Random): shuffled separately from the
+    // comparator-based sorts below since it has no direction and needs to
+    // stay stable across re-renders -- only randomSeed changing should
+    // reshuffle it.
+    if (sortBy === 'random') return shuffleSeeded(base, randomSeed);
+    const cmp: Record<Exclude<SortKey, 'random'>, (a: Song, b: Song) => number> = {
       title: (a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }),
       artist: (a, b) => a.artist.localeCompare(b.artist, undefined, { sensitivity: 'base' }) || a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }),
       dateAdded: (a, b) => a.addedAt - b.addedAt,
@@ -452,7 +495,7 @@ export default function App() {
     const sorted = [...base].sort(cmp[sortBy]);
     if (sortDir === 'desc') sorted.reverse();
     return sorted;
-  }, [viewSongs, query, sortBy, sortDir]);
+  }, [viewSongs, query, sortBy, sortDir, randomSeed]);
 
   // Feature (Pin/Unpin): pinned songs float to the top of the Library and
   // Playlist views specifically (per spec), set off by a "Pinned" section
@@ -917,6 +960,7 @@ export default function App() {
   // Feature (Sort options)
   const handleSortChange = useCallback((by: SortKey, dir: 'asc' | 'desc') => {
     setSortBy(by); setSortDir(dir);
+    if (by === 'random') setRandomSeed((s) => s + 1);
     savePreferences({ sortBy: by, sortDir: dir });
   }, []);
 
