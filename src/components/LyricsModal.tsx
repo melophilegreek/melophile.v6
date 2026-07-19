@@ -2,40 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { X, Mic2, Upload, Pencil, Trash2, Loader as Loader2 } from 'lucide-react';
 import type { Song } from '../types';
 import { saveSong } from '../lib/db';
-
-interface LrcLine { time: number; text: string }
-
-const LRC_LINE = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g;
-// Non-global twin of LRC_LINE used purely for a yes/no "does this text carry
-// timestamps" check — reusing the global regex for .test() would leave
-// lastIndex in a bad state across calls.
-const LRC_LINE_PROBE = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/;
-
-/** Parses `[mm:ss.xx]lyric text` lines (possibly several timestamps sharing
- *  one line of text, e.g. a repeated chorus) into a flat, time-sorted list. */
-function parseLrc(raw: string): LrcLine[] {
-  const lines: LrcLine[] = [];
-  for (const rawLine of raw.split('\n')) {
-    const matches = Array.from(rawLine.matchAll(LRC_LINE));
-    if (matches.length === 0) continue;
-    const text = rawLine.replace(LRC_LINE, '').trim();
-    for (const m of matches) {
-      const min = parseInt(m[1], 10);
-      const sec = parseInt(m[2], 10);
-      const frac = m[3] ? parseInt(m[3].padEnd(3, '0'), 10) / 1000 : 0;
-      lines.push({ time: min * 60 + sec + frac, text });
-    }
-  }
-  return lines.sort((a, b) => a.time - b.time);
-}
-
-/** Feature (Lyrics import): classify manually-entered lyrics the same way
- *  embedded/sibling-file lyrics are classified at import time — if at least
- *  one line carries a `[mm:ss.xx]` timestamp it's treated as LRC and gets the
- *  synced, auto-scrolling view; otherwise it's shown as a plain block. */
-function detectFormat(raw: string): 'lrc' | 'plain' {
-  return LRC_LINE_PROBE.test(raw) ? 'lrc' : 'plain';
-}
+import { isLrcText, detectLyricsFormat, parseLrc } from '../lib/lrc';
 
 interface Props {
   song: Song;
@@ -80,7 +47,15 @@ export function LyricsModal({ song, currentTime, accentColor, onClose, onUpdated
     return () => window.removeEventListener('keydown', h);
   }, [onClose, editing]);
 
-  const isLrc = localSong.lyricsFormat === 'lrc';
+  // BUG FIX (lyrics sync showing as plain text): this used to trust
+  // `localSong.lyricsFormat` alone, which is decided once at import time.
+  // Any song whose timestamps weren't recognized then (or that predates
+  // this field existing at all) was stuck rendering as a flat block of text
+  // -- brackets and all -- forever, even though the same content passes the
+  // exact same timestamp check used for manually-pasted lyrics below.
+  // Detecting live from the text itself makes every song self-heal the
+  // moment it has `[mm:ss.xx]`-style lines, with no re-import needed.
+  const isLrc = useMemo(() => isLrcText(localSong.lyrics), [localSong.lyrics]);
   const lrcLines = useMemo(() => (isLrc && localSong.lyrics ? parseLrc(localSong.lyrics) : []), [isLrc, localSong.lyrics]);
 
   const activeIndex = useMemo(() => {
@@ -118,7 +93,7 @@ export function LyricsModal({ song, currentTime, accentColor, onClose, onUpdated
   const handleSave = () => {
     const text = draft.trim();
     if (!text) return;
-    persist({ ...localSong, lyrics: text, lyricsFormat: detectFormat(text) });
+    persist({ ...localSong, lyrics: text, lyricsFormat: detectLyricsFormat(text) });
   };
 
   const handleRemove = () => {

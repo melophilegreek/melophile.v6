@@ -3,6 +3,7 @@ import { AUDIO_EXTENSIONS } from '../types';
 import { saveSongsBatch, getAllSongs, getFile, updateSongArt } from './db';
 import type { WorkerRequest, WorkerResponse } from './import.worker';
 import { extractMeta, type Meta } from './metadataParser';
+import { detectLyricsFormat } from './lrc';
 
 // `finalizing: true` marks the phase after every file has been parsed, while
 // the last (sub-batch-size) group of songs is still being committed to
@@ -79,10 +80,8 @@ function buildLrcIndex(allFiles: File[]): Map<string, File> {
 // timestamps per line for repeated lines) -- if we see that pattern, tag the
 // lyrics as 'lrc' so the lyrics viewer can parse timestamps and highlight the
 // current line; otherwise it's just a plain block of text to show as-is.
-const LRC_TIMESTAMP = /^\s*\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]/m;
-function detectLyricsFormat(text: string): 'lrc' | 'plain' {
-  return LRC_TIMESTAMP.test(text) ? 'lrc' : 'plain';
-}
+// (Shared with LyricsModal.tsx via lrc.ts so the two can't disagree on what
+// counts as synced lyrics.)
 
 // -- Worker pool for parallel metadata parsing --------------------------------
 // Parsing (ID3/Vorbis/MP4-atom/etc. byte-crunching) is the CPU-bound part of
