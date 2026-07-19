@@ -9,13 +9,16 @@ interface Props {
   currentTime: number;
   accentColor: string;
   onClose: () => void;
+  /** Feature (tap-to-seek): jump playback to a synced line's timestamp when
+   *  it's tapped, same mechanism the player bar's scrub row uses. */
+  onSeek: (time: number) => void;
   /** Called after lyrics are saved to IndexedDB, so the parent can patch its
    *  in-memory song list / currently-playing song (mirrors AlbumArtEditModal's
    *  `onUpdated`). */
   onUpdated: (updated: Song) => void;
 }
 
-export function LyricsModal({ song, currentTime, accentColor, onClose, onUpdated }: Props) {
+export function LyricsModal({ song, currentTime, accentColor, onClose, onSeek, onUpdated }: Props) {
   const activeRef = useRef<HTMLParagraphElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -174,7 +177,8 @@ export function LyricsModal({ song, currentTime, accentColor, onClose, onUpdated
           <div ref={scrollAreaRef} className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1 space-y-3 py-8">
             {lrcLines.map((line, i) => (
               <p key={i} ref={i === activeIndex ? activeRef : undefined}
-                className="text-center transition-all duration-200 leading-snug"
+                onClick={() => onSeek(line.time)}
+                className="text-center transition-all duration-200 leading-snug cursor-pointer active:opacity-60"
                 style={{
                   color: i === activeIndex ? accentColor : 'rgba(255,255,255,0.35)',
                   fontSize: i === activeIndex ? 17 : 15,

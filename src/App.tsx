@@ -1608,6 +1608,7 @@ export default function App() {
           currentTime={playerState.currentTime}
           accentColor={accentColor}
           onClose={() => setShowLyrics(false)}
+          onSeek={(t) => player.seek(t)}
           onUpdated={handleSongUpdated}
         />
       )}
